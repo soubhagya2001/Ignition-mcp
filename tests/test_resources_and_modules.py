@@ -120,3 +120,35 @@ async def test_gateway_add_module_local_install(local_state: ServerState, tmp_pa
     assert installed["result"]["status"] == "installed"
     assert installed["result"]["verified"] is True
     assert installed["result"]["restart_recommended"] is True
+
+
+async def test_set_and_delete_perspective_page(local_state: ServerState) -> None:
+    """set_perspective_page and delete_perspective_page manage page-config/config.json."""
+    mcp = _RecordingMCP()
+    perspective.register(mcp, local_state)
+    set_page = mcp.tools["set_perspective_page"]
+    del_page = mcp.tools["delete_perspective_page"]
+
+    bad = await set_page("Dashboard", "Dashboard/Overview", confirm=True)
+    assert bad["result"]["status"] == "invalid_page_config"
+
+    dry = await set_page("/overview", "Dashboard/Overview", title="Overview", dry_run=True)
+    assert dry["result"]["status"] == "dry_run"
+    assert dry["result"]["valid"] is True
+
+    written = await set_page("/overview", "Dashboard/Overview", title="Overview", confirm=True)
+    assert written["result"]["status"] == "written"
+    assert written["result"]["verified"] is True
+
+    reader = local_state.local_reader
+    assert reader is not None
+    cfg = reader.read_page_config("TestProject")
+    assert cfg is not None
+    assert cfg["pages"]["/overview"]["viewPath"] == "Dashboard/Overview"
+
+    removed = await del_page("/overview", confirm=True)
+    assert removed["result"]["status"] == "deleted"
+    assert removed["result"]["verified"] is True
+    cfg_after = reader.read_page_config("TestProject")
+    assert cfg_after is not None
+    assert "/overview" not in cfg_after["pages"]

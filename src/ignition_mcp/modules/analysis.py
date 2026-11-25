@@ -139,12 +139,19 @@ def _analyze_project(reader: LocalInstallReader, project: str) -> dict[str, Any]
     referenced: set[str] = set()
 
     page_config = reader.read_page_config(project) or {}
-    for page in page_config.get("pages", []) if isinstance(page_config, dict) else []:
-        if not isinstance(page, dict):
-            continue
-        view_ref = page.get("view") or page.get("path")
-        if isinstance(view_ref, str):
-            referenced.add(view_ref)
+    pages = page_config.get("pages") if isinstance(page_config, dict) else None
+    if isinstance(pages, dict):
+        for page in pages.values():
+            if isinstance(page, dict):
+                view_ref = page.get("viewPath") or page.get("view")
+                if isinstance(view_ref, str):
+                    referenced.add(view_ref)
+    elif isinstance(pages, list):
+        for page in pages:
+            if isinstance(page, dict):
+                view_ref = page.get("view") or page.get("viewPath") or page.get("path")
+                if isinstance(view_ref, str):
+                    referenced.add(view_ref)
 
     for view_path, view in views.items():
         if not view:

@@ -1260,6 +1260,171 @@ def register(mcp: MCPServer, state: ServerState) -> None:
         )
 
     @mcp.tool()
+    async def set_perspective_page(
+        page_url: str,
+        view_path: str,
+        title: str = "",
+        docks: dict[str, Any] | None = None,
+        shared_docks: dict[str, Any] | None = None,
+        project: str | None = None,
+        confirm: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Configure a Perspective page URL and its primary view in ``page-config/config.json``.
+
+        Matches Ignition Designer's Page Configuration (Shared Settings -> Page URL + Primary View).
+
+        Args:
+            page_url: Route path starting with ``/``, e.g. ``"/"`` or ``"/Dashboard"``.
+            view_path: Primary view path, e.g. ``"Dashboard/Overview"``.
+            title: Optional browser page title.
+            docks: Optional per-page dock configuration.
+            shared_docks: Optional ``sharedDocks`` configuration to merge/set on the project.
+            project: Project name; defaults to the active project.
+            confirm: Must be ``True`` to write.
+            dry_run: Validate and preview the ``page-config/config.json`` diff without writing.
+
+        Returns:
+            Update acknowledgement or a validation/dry-run payload.
+        """
+        guard = state.write_guard("set_perspective_page", confirm, dry_run)
+        if guard:
+            return guard
+        proj, error = resolve_project(state, project)
+        if error:
+            return error
+        reader = state.local_reader
+        if reader is None:
+            return unsupported(
+                state,
+                "set_perspective_page",
+                hint="Page configuration writes require a local install (IGNITION_INSTALL_PATH).",
+            )
+
+        issues: list[str] = []
+        if not page_url or not page_url.startswith("/"):
+            issues.append("page_url must start with '/' (e.g. '/' or '/Dashboard').")
+        known_views: set[str] = set()
+        for p_name in reader.inheritance_chain(proj or ""):
+            known_views.update(reader.list_perspective_views(p_name))
+        if known_views and view_path not in known_views:
+            issues.append(f"Primary view '{view_path}' was not found in project '{proj}'.")
+
+        current = reader.read_page_config(proj or "")
+        before = copy.deepcopy(current) if isinstance(current, dict) else {"pages": {}}
+        after = copy.deepcopy(before)
+        pages = after.get("pages")
+        if not isinstance(pages, dict):
+            pages = {}
+            after["pages"] = pages
+
+        entry: dict[str, Any] = {"title": title, "viewPath": view_path}
+        if docks is not None:
+            entry["docks"] = docks
+        pages[page_url] = entry
+        if shared_docks is not None:
+            after["sharedDocks"] = shared_docks
+
+        if dry_run:
+            return state.tool_response(
+                {
+                    "status": "dry_run",
+                    "project": proj,
+                    "page_url": page_url,
+                    "view_path": view_path,
+                    "valid": not issues,
+                    "validation_issues": issues,
+                    "diff": preview_json_change(before, after, "page-config/config.json"),
+                }
+            )
+        if issues:
+            return state.tool_response(
+                {"status": "invalid_page_config", "issues": issues, "project": proj}
+            )
+
+        written = reader.write_page_config(proj or "", after)
+        if written is None:
+            return state.tool_response({"status": "write_failed", "page_url": page_url})
+        verified = reader.read_page_config(proj or "") == after
+        state.record_action(
+            "set_perspective_page", "ok", project=proj, page_url=page_url, view_path=view_path
+        )
+        return state.tool_response(
+            {
+                "status": "written",
+                "project": proj,
+                "page_url": page_url,
+                "view_path": view_path,
+                "path": str(written),
+                "verified": verified,
+            }
+        )
+
+    @mcp.tool()
+    async def delete_perspective_page(
+        page_url: str,
+        project: str | None = None,
+        confirm: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Remove a page URL mapping from ``page-config/config.json``.
+
+        Args:
+            page_url: Route path to remove, e.g. ``"/OldPage"``.
+            project: Project name; defaults to the active project.
+            confirm: Must be ``True`` to write.
+            dry_run: Preview the diff without writing.
+
+        Returns:
+            Deletion acknowledgement or a dry-run/not-found payload.
+        """
+        guard = state.write_guard("delete_perspective_page", confirm, dry_run)
+        if guard:
+            return guard
+        proj, error = resolve_project(state, project)
+        if error:
+            return error
+        reader = state.local_reader
+        if reader is None:
+            return unsupported(
+                state,
+                "delete_perspective_page",
+                hint="Page configuration writes require a local install (IGNITION_INSTALL_PATH).",
+            )
+        current = reader.read_page_config(proj or "")
+        if not isinstance(current, dict) or not isinstance(current.get("pages"), dict):
+            return state.tool_response(
+                {"status": "not_found", "project": proj, "page_url": page_url}
+            )
+        if page_url not in current["pages"]:
+            return state.tool_response(
+                {"status": "not_found", "project": proj, "page_url": page_url}
+            )
+        after = copy.deepcopy(current)
+        del after["pages"][page_url]
+        if dry_run:
+            return state.tool_response(
+                {
+                    "status": "dry_run",
+                    "project": proj,
+                    "page_url": page_url,
+                    "diff": preview_json_change(current, after, "page-config/config.json"),
+                }
+            )
+        written = reader.write_page_config(proj or "", after)
+        verified = reader.read_page_config(proj or "") == after
+        state.record_action("delete_perspective_page", "ok", project=proj, page_url=page_url)
+        return state.tool_response(
+            {
+                "status": "deleted",
+                "project": proj,
+                "page_url": page_url,
+                "path": str(written) if written else None,
+                "verified": verified,
+            }
+        )
+
+    @mcp.tool()
     async def find_views_by_css(css_class: str, project: str | None = None) -> dict[str, Any]:
         """Find views and components that use a style class.
 

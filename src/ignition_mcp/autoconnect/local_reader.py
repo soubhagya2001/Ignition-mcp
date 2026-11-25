@@ -445,6 +445,40 @@ class LocalInstallReader:
                     return None
         return None
 
+    def write_page_config(self, project: str, page_config: dict[str, Any]) -> Path | None:
+        """Write Perspective ``page-config/config.json`` and its ``resource.json``.
+
+        Args:
+            project: Project name.
+            page_config: Full ``config.json`` payload (``pages``, ``sharedDocks``, ...).
+
+        Returns:
+            The written ``config.json`` path, or ``None`` if the project path is invalid.
+        """
+        base = self.project_path(project) / PERSPECTIVE_MODULE / "page-config"
+        config_file = self.safe_path(base, "config.json")
+        res_file = self.safe_path(base, "resource.json")
+        if not config_file or not res_file:
+            return None
+        if config_file.exists():
+            snapshot_file(config_file, "write_page_config", project=project)
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(page_config, indent=2), encoding="utf-8")
+
+        existing_res: dict[str, Any] | None = None
+        if res_file.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(res_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing_res = loaded
+        if res_file.exists():
+            snapshot_file(res_file, "write_page_config", project=project)
+        res_file.write_text(
+            json.dumps(build_resource_json(["config.json"], existing=existing_res), indent=2),
+            encoding="utf-8",
+        )
+        return config_file
+
     def list_style_classes(self, project: str) -> list[str]:
         """List style class names defined in a project."""
         return sorted(self._style_class_files(project))
