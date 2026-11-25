@@ -373,33 +373,34 @@ def _windows_designer_processes() -> list[dict[str, Any]]:
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
 
-    try:
-        import ctypes
-        from ctypes import wintypes
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
 
-        enum_windows = ctypes.windll.user32.EnumWindows
-        get_window_text = ctypes.windll.user32.GetWindowTextW
-        get_window_text_length = ctypes.windll.user32.GetWindowTextLengthW
-        is_window_visible = ctypes.windll.user32.IsWindowVisible
-        enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-        found_titles: list[str] = []
+            enum_windows = ctypes.windll.user32.EnumWindows
+            get_window_text = ctypes.windll.user32.GetWindowTextW
+            get_window_text_length = ctypes.windll.user32.GetWindowTextLengthW
+            is_window_visible = ctypes.windll.user32.IsWindowVisible
+            enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            found_titles: list[str] = []
 
-        @enum_proc
-        def collect(hwnd: int, _lparam: int) -> bool:
-            if is_window_visible(hwnd):
-                length = get_window_text_length(hwnd)
-                if length:
-                    buffer = ctypes.create_unicode_buffer(length + 1)
-                    get_window_text(hwnd, buffer, length + 1)
-                    title = buffer.value
-                    if "ignition designer" in title.lower():
-                        found_titles.append(title)
-            return True
+            @enum_proc
+            def collect(hwnd: int, _lparam: int) -> bool:
+                if is_window_visible(hwnd):
+                    length = get_window_text_length(hwnd)
+                    if length:
+                        buffer = ctypes.create_unicode_buffer(length + 1)
+                        get_window_text(hwnd, buffer, length + 1)
+                        title = buffer.value
+                        if "ignition designer" in title.lower():
+                            found_titles.append(title)
+                return True
 
-        enum_windows(collect, 0)
-        processes.extend({"window_title": title} for title in found_titles)
-    except (AttributeError, OSError):
-        pass
+            enum_windows(collect, 0)
+            processes.extend({"window_title": title} for title in found_titles)
+        except (AttributeError, OSError):
+            pass
     return processes
 
 

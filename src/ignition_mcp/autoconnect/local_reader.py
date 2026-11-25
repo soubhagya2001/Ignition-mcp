@@ -20,12 +20,14 @@ Directory layout used (Ignition 8.1+):
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,9 @@ PERSPECTIVE_MODULE = "com.inductiveautomation.perspective"
 SCRIPT_PYTHON_DIR = Path("ignition") / "script-python"
 NAMED_QUERY_MODULE = "com.inductiveautomation.sqltables"
 NAMED_QUERY_DIR = Path("named-query")
+WEBDEV_MODULE = "com.inductiveautomation.webdev"
+WEBDEV_RESOURCES_DIR = Path("resources")
+VALID_RESOURCE_SCOPES = ("G", "A", "C", "N")
 
 
 @dataclass
@@ -396,7 +401,37 @@ class LocalInstallReader:
             snapshot_file(view_file, "write_perspective_view", project=project, view=view_path)
         view_file.parent.mkdir(parents=True, exist_ok=True)
         view_file.write_text(json.dumps(view, indent=2, sort_keys=False), encoding="utf-8")
+        existing_resource = self.read_view_resource_json(project, view_path)
+        files = ["view.json"]
+        if (view_file.parent / "thumbnail.png").is_file():
+            files.append("thumbnail.png")
+        resource_doc = build_resource_json(files, existing=existing_resource)
+        self.write_view_resource_json(project, view_path, resource_doc)
         return view_file
+
+    def read_view_resource_json(self, project: str, view_path: str) -> dict[str, Any] | None:
+        """Read ``resource.json`` for a Perspective view, or ``None`` if missing."""
+        res_file = self.safe_path(self._views_root(project), view_path, "resource.json")
+        if not res_file or not res_file.exists():
+            return None
+        try:
+            data = json.loads(res_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def write_view_resource_json(
+        self, project: str, view_path: str, resource: dict[str, Any]
+    ) -> Path | None:
+        """Write ``resource.json`` for a Perspective view after snapshotting if present."""
+        res_file = self.safe_path(self._views_root(project), view_path, "resource.json")
+        if not res_file:
+            return None
+        if res_file.exists():
+            snapshot_file(res_file, "write_view_resource_json", project=project, view=view_path)
+        res_file.parent.mkdir(parents=True, exist_ok=True)
+        res_file.write_text(json.dumps(resource, indent=2), encoding="utf-8")
+        return res_file
 
     def read_page_config(self, project: str) -> dict[str, Any] | None:
         """Read the Perspective page configuration for a project."""
@@ -596,6 +631,97 @@ class LocalInstallReader:
         return query_file
 
     # ------------------------------------------------------------------
+    # WebDev endpoints
+    # ------------------------------------------------------------------
+
+    def _webdev_root(self, project: str) -> Path:
+        """Return the WebDev resources directory for a project."""
+        return self.project_path(project) / WEBDEV_MODULE / WEBDEV_RESOURCES_DIR
+
+    def list_webdev_endpoints(self, project: str) -> list[str]:
+        """List WebDev endpoint paths in a project."""
+        root = self._webdev_root(project)
+        if not root.exists():
+            return []
+        return sorted(cfg.parent.relative_to(root).as_posix() for cfg in root.rglob("config.json"))
+
+    def read_webdev_endpoint(self, project: str, endpoint_path: str) -> dict[str, Any] | None:
+        """Read a WebDev endpoint's ``config.json``, handler scripts, and ``resource.json``."""
+        root = self._webdev_root(project)
+        endpoint_dir = self.safe_path(root, endpoint_path)
+        if not endpoint_dir or not (endpoint_dir / "config.json").is_file():
+            return None
+        try:
+            config = json.loads((endpoint_dir / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        scripts: dict[str, str] = {}
+        for py_file in sorted(endpoint_dir.glob("*.py")):
+            with contextlib.suppress(OSError):
+                scripts[py_file.stem] = py_file.read_text(encoding="utf-8")
+        resource: dict[str, Any] | None = None
+        res_file = endpoint_dir / "resource.json"
+        if res_file.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(res_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    resource = loaded
+        return {"config": config, "scripts": scripts, "resource": resource}
+
+    def write_webdev_endpoint(
+        self,
+        project: str,
+        endpoint_path: str,
+        config: dict[str, Any],
+        scripts: dict[str, str],
+    ) -> Path | None:
+        """Create or update a WebDev endpoint on disk with ``resource.json``."""
+        root = self._webdev_root(project)
+        endpoint_dir = self.safe_path(root, endpoint_path)
+        if not endpoint_dir:
+            return None
+        config_file = endpoint_dir / "config.json"
+        if config_file.exists():
+            snapshot_file(
+                config_file, "write_webdev_endpoint", project=project, endpoint=endpoint_path
+            )
+        endpoint_dir.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+        files = ["config.json"]
+        for handler_name, code in sorted(scripts.items()):
+            py_file = self.safe_path(endpoint_dir, f"{handler_name}.py")
+            if py_file is None:
+                continue
+            if py_file.exists():
+                snapshot_file(
+                    py_file,
+                    "write_webdev_endpoint",
+                    project=project,
+                    endpoint=endpoint_path,
+                    handler=handler_name,
+                )
+            py_file.write_text(code, encoding="utf-8")
+            files.append(f"{handler_name}.py")
+
+        res_file = endpoint_dir / "resource.json"
+        existing_res: dict[str, Any] | None = None
+        if res_file.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(res_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing_res = loaded
+        if res_file.exists():
+            snapshot_file(
+                res_file, "write_webdev_endpoint", project=project, endpoint=endpoint_path
+            )
+        res_file.write_text(
+            json.dumps(build_resource_json(files, existing=existing_res), indent=2),
+            encoding="utf-8",
+        )
+        return endpoint_dir
+
+    # ------------------------------------------------------------------
     # Generic resources and search
     # ------------------------------------------------------------------
 
@@ -791,3 +917,62 @@ async def _distinct_names(db: Any, keywords: Sequence[str]) -> list[str]:
             continue
         names.extend(str(row[0]) for row in rows if row[0] not in (None, ""))
     return sorted(set(names))
+
+
+def validate_resource_json(data: Any) -> list[str]:
+    """Validate an Ignition ``resource.json`` document.
+
+    Args:
+        data: Decoded JSON value to check.
+
+    Returns:
+        List of validation error messages (empty when valid).
+    """
+    if not isinstance(data, dict):
+        return ["resource.json must be a JSON object."]
+    issues: list[str] = []
+    scope = data.get("scope")
+    if scope not in VALID_RESOURCE_SCOPES:
+        issues.append(
+            f"resource.json 'scope' must be one of {VALID_RESOURCE_SCOPES}, got {scope!r}."
+        )
+    version = data.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        issues.append("resource.json 'version' must be a positive integer.")
+    for flag in ("restricted", "overridable"):
+        if flag in data and not isinstance(data[flag], bool):
+            issues.append(f"resource.json '{flag}' must be a boolean.")
+    files = data.get("files")
+    if not isinstance(files, list) or not files or not all(isinstance(f, str) and f for f in files):
+        issues.append("resource.json 'files' must be a non-empty list of filenames.")
+    return issues
+
+
+def build_resource_json(
+    files: Sequence[str],
+    *,
+    scope: str = "G",
+    restricted: bool = False,
+    overridable: bool = True,
+    actor: str = "ignition-mcp",
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a valid Ignition ``resource.json`` payload.
+
+    Preserves existing tracked filenames (such as ``thumbnail.png``) when updating.
+    """
+    merged_files = list(dict.fromkeys([*(existing.get("files", []) if existing else []), *files]))
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sig_input = json.dumps({"scope": scope, "files": merged_files, "ts": stamp}, sort_keys=True)
+    signature = hashlib.sha256(sig_input.encode("utf-8")).hexdigest()
+    return {
+        "scope": scope,
+        "version": 1,
+        "restricted": restricted,
+        "overridable": overridable,
+        "files": merged_files,
+        "attributes": {
+            "lastModification": {"actor": actor, "timestamp": stamp},
+            "lastModificationSignature": signature,
+        },
+    }

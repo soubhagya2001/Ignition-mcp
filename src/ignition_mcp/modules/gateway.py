@@ -10,10 +10,15 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import shutil
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+import anyio
 
 from ignition_mcp.client.gateway_api import GatewayError
 from ignition_mcp.mcp_compat import MCPServer
@@ -614,6 +619,100 @@ def register(mcp: MCPServer, state: ServerState) -> None:
         state.record_action("gateway_restart", "ok")
         return state.tool_response({"status": "restart_requested", "response": payload})
 
+    @mcp.tool()
+    async def gateway_add_module(
+        modl_path: str,
+        confirm: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Install an Ignition ``.modl`` module via the Gateway API or local ``user-lib/modules``.
+
+        Args:
+            modl_path: Path to the ``.modl`` archive on the MCP host.
+            confirm: Must be ``True`` to install the module.
+            dry_run: Validate the ``.modl`` archive and preview the target without installing.
+
+        Returns:
+            Installation result, module metadata, and whether a ``gateway_restart`` is needed.
+        """
+        guard = state.write_guard("gateway_add_module", confirm, dry_run)
+        if guard:
+            return guard
+
+        archive = Path(modl_path)
+        meta, issues = await anyio.to_thread.run_sync(_inspect_modl, archive)
+        reader = state.local_reader
+        local_dest = reader.root / "user-lib" / "modules" / archive.name if reader else None
+
+        if dry_run:
+            return state.tool_response(
+                {
+                    "status": "dry_run",
+                    "modl_path": str(archive),
+                    "valid": not issues,
+                    "validation_issues": issues,
+                    "module": meta,
+                    "target": (
+                        "gateway_api"
+                        if state.has_gateway
+                        else (str(local_dest) if local_dest else "unavailable")
+                    ),
+                }
+            )
+        if issues:
+            return state.tool_response(
+                {"status": "invalid_module", "modl_path": str(archive), "issues": issues}
+            )
+
+        if state.has_gateway:
+            payload = await anyio.to_thread.run_sync(archive.read_bytes)
+            try:
+                endpoint, response = await state.gateway.first_available(
+                    ("/modules/install", "/gateway/modules/install", "/data/api/v1/modules"),
+                    method="POST",
+                    content=payload,
+                )
+            except GatewayError as exc:
+                if exc.status != 404 or local_dest is None:
+                    return _gateway_or_unsupported(state, exc, "gateway_add_module")
+            else:
+                state.record_action("gateway_add_module", "ok", module=archive.name, via="api")
+                return state.tool_response(
+                    {
+                        "status": "installed",
+                        "via": "gateway_api",
+                        "endpoint": endpoint,
+                        "module": meta,
+                        "response": response,
+                        "restart_recommended": True,
+                    }
+                )
+
+        if local_dest is None:
+            return unsupported(
+                state,
+                "gateway_add_module",
+                hint="Connect to a Gateway or set IGNITION_INSTALL_PATH to install a .modl file.",
+            )
+
+        try:
+            await anyio.to_thread.run_sync(_copy_modl_file, archive, local_dest)
+        except OSError as exc:
+            return state.tool_response(
+                {"status": "write_failed", "path": str(local_dest), "message": str(exc)}
+            )
+        state.record_action("gateway_add_module", "ok", module=archive.name, via="local_install")
+        return state.tool_response(
+            {
+                "status": "installed",
+                "via": "local_filesystem",
+                "path": str(local_dest),
+                "module": meta,
+                "verified": local_dest.is_file(),
+                "restart_recommended": True,
+            }
+        )
+
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -776,3 +875,34 @@ def _gateway_or_unsupported(state: ServerState, exc: GatewayError, tool: str) ->
 def _normalise_level(value: str) -> str:
     """Normalise a log level string for comparisons."""
     return re.sub(r"[^A-Z]", "", value.upper()) or "WARN"
+
+
+def _inspect_modl(archive: Path) -> tuple[dict[str, Any], list[str]]:
+    """Validate a ``.modl`` archive and extract ``module.xml`` metadata when present."""
+    issues: list[str] = []
+    if not archive.is_file():
+        return {}, [f"Module file '{archive}' does not exist."]
+    if archive.suffix.lower() != ".modl":
+        issues.append(f"Expected a .modl file, got '{archive.name}'.")
+    if not zipfile.is_zipfile(archive):
+        issues.append(f"'{archive.name}' is not a valid ZIP/.modl archive.")
+        return {}, issues
+
+    meta: dict[str, Any] = {"filename": archive.name, "size_bytes": archive.stat().st_size}
+    with zipfile.ZipFile(archive) as zf:
+        if "module.xml" in zf.namelist():
+            try:
+                root = ET.fromstring(zf.read("module.xml"))
+                for tag in ("id", "name", "version", "requiredIgnitionVersion"):
+                    elem = root.find(f".//{tag}")
+                    if elem is not None and elem.text:
+                        meta[tag] = elem.text.strip()
+            except ET.ParseError:
+                issues.append("module.xml inside the .modl archive is malformed XML.")
+    return meta, issues
+
+
+def _copy_modl_file(src: Path, dest: Path) -> None:
+    """Copy a ``.modl`` file into ``user-lib/modules``."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)

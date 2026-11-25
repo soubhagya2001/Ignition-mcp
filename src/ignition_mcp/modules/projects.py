@@ -22,7 +22,8 @@ import anyio
 from ignition_mcp.client.gateway_api import GatewayError
 from ignition_mcp.mcp_compat import MCPServer
 from ignition_mcp.modules.common import error_response, ok, resolve_project, unsupported
-from ignition_mcp.safety import text_diff
+from ignition_mcp.modules.scripting import _validate_python_syntax
+from ignition_mcp.safety import preview_json_change, text_diff
 from ignition_mcp.state import ServerState
 
 logger = logging.getLogger(__name__)
@@ -677,6 +678,186 @@ def register(mcp: MCPServer, state: ServerState) -> None:
                 "changed": sorted(changed),
                 "identical": names_a == names_b and not changed,
             },
+        )
+
+    @mcp.tool()
+    async def list_webdev_endpoints(project: str | None = None) -> dict[str, Any]:
+        """List WebDev HTTP endpoints configured in a project.
+
+        Args:
+            project: Project name; defaults to the active project.
+
+        Returns:
+            Sorted WebDev endpoint paths under ``com.inductiveautomation.webdev/resources``.
+        """
+        proj, error = resolve_project(state, project)
+        if error:
+            return error
+        reader = state.local_reader
+        if reader is None:
+            return unsupported(
+                state,
+                "list_webdev_endpoints",
+                hint="WebDev endpoints are read from disk; set IGNITION_INSTALL_PATH.",
+            )
+        endpoints = reader.list_webdev_endpoints(proj or "")
+        return ok(
+            state,
+            "list_webdev_endpoints",
+            {"project": proj, "endpoints": endpoints, "count": len(endpoints)},
+        )
+
+    @mcp.tool()
+    async def read_webdev_endpoint(
+        endpoint_path: str, project: str | None = None
+    ) -> dict[str, Any]:
+        """Read a WebDev endpoint's ``config.json``, handler scripts, and ``resource.json``.
+
+        Args:
+            endpoint_path: Endpoint path, e.g. ``api/v1/health``.
+            project: Project name; defaults to the active project.
+
+        Returns:
+            Endpoint configuration, handler scripts, and resource metadata.
+        """
+        proj, error = resolve_project(state, project)
+        if error:
+            return error
+        reader = state.local_reader
+        if reader is None:
+            return unsupported(
+                state,
+                "read_webdev_endpoint",
+                hint="WebDev endpoints are read from disk; set IGNITION_INSTALL_PATH.",
+            )
+        data = reader.read_webdev_endpoint(proj or "", endpoint_path)
+        if data is None:
+            return state.tool_response(
+                {"status": "not_found", "project": proj, "endpoint_path": endpoint_path}
+            )
+        return ok(
+            state,
+            "read_webdev_endpoint",
+            {"project": proj, "endpoint_path": endpoint_path, **data},
+        )
+
+    @mcp.tool()
+    async def create_webdev_endpoint(
+        endpoint_path: str,
+        methods: list[str] | None = None,
+        handlers: dict[str, str] | None = None,
+        require_auth: bool = False,
+        require_https: bool = False,
+        required_roles: str = "",
+        user_source: str = "",
+        project: str | None = None,
+        confirm: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Create or update a WebDev HTTP endpoint in a local Ignition project.
+
+        Args:
+            endpoint_path: URL path relative to WebDev root, e.g. ``api/health``.
+            methods: HTTP handler names to enable (e.g. ``["doGet", "doPost"]``). Defaults to
+                ``list(handlers)`` or ``["doGet"]``.
+            handlers: Mapping of handler name (e.g. ``"doGet"``) to Python/Jython source code.
+            require_auth: Require Ignition authentication on enabled handlers.
+            require_https: Require HTTPS on enabled handlers.
+            required_roles: Comma-separated role names when auth is required.
+            user_source: User source name when auth is required.
+            project: Project name; defaults to the active project.
+            confirm: Must be ``True`` to write.
+            dry_run: Validate handler scripts and preview changes without writing.
+
+        Returns:
+            Creation acknowledgement or a dry-run/validation payload.
+        """
+        guard = state.write_guard("create_webdev_endpoint", confirm, dry_run)
+        if guard:
+            return guard
+        proj, error = resolve_project(state, project)
+        if error:
+            return error
+        reader = state.local_reader
+        if reader is None:
+            return unsupported(
+                state,
+                "create_webdev_endpoint",
+                hint="WebDev endpoint creation needs a local install (IGNITION_INSTALL_PATH).",
+            )
+
+        all_handlers = (
+            "doGet",
+            "doPost",
+            "doPut",
+            "doDelete",
+            "doHead",
+            "doOptions",
+            "doTrace",
+            "doPatch",
+        )
+        enabled = set(methods or (list(handlers) if handlers else ["doGet"]))
+        unknown = sorted((enabled | set(handlers or {})) - set(all_handlers))
+        issues: list[str] = []
+        if unknown:
+            issues.append(f"Unknown WebDev handler(s): {', '.join(unknown)}.")
+
+        scripts: dict[str, str] = {}
+        for name in sorted(enabled):
+            code = (handlers or {}).get(name)
+            if code is None:
+                code = f"def {name}(request, session):\n\treturn {{'json': {{'status': 'ok'}}}}\n"
+            for err in _validate_python_syntax(code):
+                issues.append(f"{name}.py: {err}")
+            scripts[name] = code
+
+        config: dict[str, Any] = {"resource-type": "python-resource"}
+        for name in all_handlers:
+            config[name] = {
+                "enabled": name in enabled,
+                "max-retry-attempts": 3,
+                "require-auth": require_auth,
+                "require-https": require_https,
+                "required-roles": required_roles,
+                "user-source": user_source,
+            }
+
+        existing = reader.read_webdev_endpoint(proj or "", endpoint_path)
+        if dry_run:
+            return state.tool_response(
+                {
+                    "status": "dry_run",
+                    "project": proj,
+                    "endpoint_path": endpoint_path,
+                    "valid": not issues,
+                    "validation_issues": issues,
+                    "enabled_handlers": sorted(enabled),
+                    "config_diff": preview_json_change(
+                        existing.get("config") if existing else None,
+                        config,
+                        f"{endpoint_path}/config.json",
+                    ),
+                }
+            )
+        if issues:
+            return state.tool_response(
+                {"status": "invalid_endpoint", "issues": issues, "project": proj}
+            )
+
+        written = reader.write_webdev_endpoint(proj or "", endpoint_path, config, scripts)
+        if written is None:
+            return state.tool_response({"status": "write_failed", "endpoint_path": endpoint_path})
+        verified = reader.read_webdev_endpoint(proj or "", endpoint_path) is not None
+        state.record_action("create_webdev_endpoint", "ok", project=proj, endpoint=endpoint_path)
+        return state.tool_response(
+            {
+                "status": "written",
+                "project": proj,
+                "endpoint_path": endpoint_path,
+                "path": str(written),
+                "enabled_handlers": sorted(enabled),
+                "verified": verified,
+            }
         )
 
 

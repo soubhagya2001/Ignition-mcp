@@ -21,6 +21,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
+from ignition_mcp.autoconnect.local_reader import build_resource_json, validate_resource_json
 from ignition_mcp.client.gateway_api import GatewayError
 from ignition_mcp.mcp_compat import MCPServer
 from ignition_mcp.modules.common import error_response, ok, resolve_project, unsupported
@@ -229,6 +230,102 @@ def register(mcp: MCPServer, state: ServerState) -> None:
         state.record_action("update_perspective_view", "ok", project=proj, view=view_path)
         return state.tool_response(
             {"status": "updated", "project": proj, "view_path": view_path, **result}
+        )
+
+    @mcp.tool()
+    async def create_view_resource_json(
+        view_path: str,
+        project: str | None = None,
+        scope: str = "G",
+        restricted: bool = False,
+        overridable: bool = True,
+        files: list[str] | None = None,
+        confirm: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Create or update ``resource.json`` for a Perspective view with validation.
+
+        Args:
+            view_path: Target view path, e.g. ``Dashboard/Overview``.
+            project: Project name; defaults to the active project.
+            scope: Resource scope (``G``, ``A``, ``C``, or ``N``).
+            restricted: Whether resource access is restricted.
+            overridable: Whether child projects may override this view.
+            files: Tracked files list (defaults to ``["view.json"]`` plus ``thumbnail.png`` if present).
+            confirm: Must be ``True`` to write.
+            dry_run: Validate and preview the ``resource.json`` diff without writing.
+
+        Returns:
+            Creation/update acknowledgement or a validation/dry-run payload.
+        """
+        guard = state.write_guard("create_view_resource_json", confirm, dry_run)
+        if guard:
+            return guard
+        proj, error = resolve_project(state, project)
+        if error:
+            return error
+        reader = state.local_reader
+        if reader is None:
+            return unsupported(
+                state,
+                "create_view_resource_json",
+                hint="resource.json writes require a local Ignition install (IGNITION_INSTALL_PATH).",
+            )
+        view_dir = reader.safe_path(
+            reader.project_path(proj or ""),
+            "com.inductiveautomation.perspective",
+            "views",
+            view_path,
+        )
+        if view_dir is None:
+            return state.tool_response({"status": "invalid_path", "view_path": view_path})
+
+        existing = reader.read_view_resource_json(proj or "", view_path)
+        tracked = list(files) if files is not None else ["view.json"]
+        if files is None and (view_dir / "thumbnail.png").is_file():
+            tracked.append("thumbnail.png")
+
+        proposed = build_resource_json(
+            tracked,
+            scope=scope,
+            restricted=restricted,
+            overridable=overridable,
+            existing=existing,
+        )
+        issues = validate_resource_json(proposed)
+        if not (view_dir / "view.json").is_file():
+            issues.append(f"view.json does not exist at '{view_path}'.")
+
+        if dry_run:
+            return state.tool_response(
+                {
+                    "status": "dry_run",
+                    "project": proj,
+                    "view_path": view_path,
+                    "valid": not issues,
+                    "validation_issues": issues,
+                    "proposed": proposed,
+                    "diff": preview_json_change(existing, proposed, f"{view_path}/resource.json"),
+                }
+            )
+        if issues:
+            return state.tool_response(
+                {"status": "invalid_resource_json", "issues": issues, "project": proj}
+            )
+        written = reader.write_view_resource_json(proj or "", view_path, proposed)
+        if written is None:
+            return state.tool_response({"status": "write_failed", "view_path": view_path})
+        verified = reader.read_view_resource_json(proj or "", view_path) == proposed
+        state.record_action("create_view_resource_json", "ok", project=proj, view=view_path)
+        return state.tool_response(
+            {
+                "status": "written",
+                "project": proj,
+                "view_path": view_path,
+                "path": str(written),
+                "verified": verified,
+                "resource": proposed,
+            }
         )
 
     @mcp.tool()
