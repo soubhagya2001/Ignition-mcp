@@ -1,0 +1,51 @@
+services:
+  ignition:
+    image: inductiveautomation/ignition:8.3.8
+    ports:
+      - "8088:8088"
+      - "8043:8043"
+    volumes:
+      - ignition-data:/usr/local/bin/ignition/data
+    environment:
+      ACCEPT_IGNITION_EULA: "Y"
+      GATEWAY_ADMIN_USERNAME: admin
+      GATEWAY_ADMIN_PASSWORD_FILE: /run/secrets/gateway-admin-password
+      IGNITION_EDITION: standard
+    secrets:
+      - gateway-admin-password
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8088/data/status >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  ignition-mcp:
+    build: .
+    depends_on:
+      ignition:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      IGNITION_GATEWAY_URL: http://ignition:8088
+      IGNITION_SCAN_NETWORK: "false"
+      IGNITION_READONLY: "true"
+      IGNITION_USERNAME: admin
+      IGNITION_PASSWORD_FILE: /run/secrets/gateway-admin-password
+      IGNITION_INSTALL_PATH: /ignition
+      IGNITION_TRANSPORT: http
+      IGNITION_HOST: 0.0.0.0
+      IGNITION_PORT: "8080"
+    volumes:
+      - ./artifacts:/artifacts
+      - ignition-data:/ignition/data:ro
+    secrets:
+      - gateway-admin-password
+
+volumes:
+  ignition-data:
+
+secrets:
+  gateway-admin-password:
+    file: ./secrets/gateway-admin-password

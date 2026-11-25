@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# uv
+.uv/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local planning docs (keep src/ignition_mcp/docs/ tracked)
+/docs/
+
+# Agent / local index caches
+.codegraph/
+.claude/
+.agent/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# Secrets — never commit real credentials
+*.env
+!.env.example
+secrets/
+
+# Ignition project exports and artifacts (can be large / contain secrets)
+*.zip
+*.gwbk
+artifacts/
+backups/
+exports/
+project_backups/
+
+# Logs
+*.log
+logs/
